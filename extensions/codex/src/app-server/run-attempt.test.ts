@@ -11,7 +11,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CodexServerNotification } from "./protocol.js";
 import { runCodexAppServerAttempt, __testing } from "./run-attempt.js";
 import { writeCodexAppServerBinding } from "./session-binding.js";
-import { buildThreadResumeParams, buildTurnStartParams } from "./thread-lifecycle.js";
+import {
+  buildThreadResumeParams,
+  buildTurnStartParams,
+  startOrResumeThread,
+} from "./thread-lifecycle.js";
 
 let tempDir: string;
 
@@ -70,7 +74,9 @@ function createAppServerHarness(
     request,
     requests,
     async waitForMethod(method: string) {
-      await vi.waitFor(() => expect(requests.some((entry) => entry.method === method)).toBe(true));
+      await vi.waitFor(() => expect(requests.some((entry) => entry.method === method)).toBe(true), {
+        interval: 1,
+      });
     },
     async completeTurn(params: { threadId: string; turnId: string }) {
       await notify({
@@ -139,12 +145,14 @@ describe("runCodexAppServerAttempt", () => {
     await waitForMethod("turn/start");
 
     expect(queueAgentHarnessMessage("session-1", "more context")).toBe(true);
-    await vi.waitFor(() =>
-      expect(requests.some((entry) => entry.method === "turn/steer")).toBe(true),
+    await vi.waitFor(
+      () => expect(requests.some((entry) => entry.method === "turn/steer")).toBe(true),
+      { interval: 1 },
     );
     expect(abortAgentHarnessRun("session-1")).toBe(true);
-    await vi.waitFor(() =>
-      expect(requests.some((entry) => entry.method === "turn/interrupt")).toBe(true),
+    await vi.waitFor(
+      () => expect(requests.some((entry) => entry.method === "turn/interrupt")).toBe(true),
+      { interval: 1 },
     );
 
     const result = await run;
@@ -307,10 +315,63 @@ describe("runCodexAppServerAttempt", () => {
     );
     params.timeoutMs = 1;
 
-    await expect(runCodexAppServerAttempt(params)).rejects.toThrow(
+    await expect(runCodexAppServerAttempt(params, { startupTimeoutFloorMs: 1 })).rejects.toThrow(
       "codex app-server startup timed out",
     );
     expect(queueAgentHarnessMessage("session-1", "after timeout")).toBe(false);
+  });
+
+  it("passes the selected auth profile into app-server startup", async () => {
+    const seenAuthProfileIds: Array<string | undefined> = [];
+    const requests: string[] = [];
+    let notify: (notification: CodexServerNotification) => Promise<void> = async () => undefined;
+    __testing.setCodexAppServerClientFactoryForTests(async (_startOptions, authProfileId) => {
+      seenAuthProfileIds.push(authProfileId);
+      return {
+        request: async (method: string) => {
+          requests.push(method);
+          if (method === "thread/start") {
+            return {
+              thread: { id: "thread-1" },
+              model: "gpt-5.4-codex",
+              modelProvider: "openai",
+            };
+          }
+          if (method === "turn/start") {
+            return { turn: { id: "turn-1", status: "inProgress" } };
+          }
+          return {};
+        },
+        addNotificationHandler: (handler: typeof notify) => {
+          notify = handler;
+          return () => undefined;
+        },
+        addRequestHandler: () => () => undefined,
+      } as never;
+    });
+    const params = createParams(
+      path.join(tempDir, "session.jsonl"),
+      path.join(tempDir, "workspace"),
+    );
+    params.authProfileId = "openai-codex:work";
+
+    const run = runCodexAppServerAttempt(params);
+    await vi.waitFor(() => expect(seenAuthProfileIds).toEqual(["openai-codex:work"]), {
+      interval: 1,
+    });
+    await vi.waitFor(() => expect(requests).toContain("turn/start"), { interval: 1 });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await notify({
+      method: "turn/completed",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        turn: { id: "turn-1", status: "completed" },
+      },
+    });
+    await run;
+
+    expect(seenAuthProfileIds).toEqual(["openai-codex:work"]);
   });
 
   it("times out turn start before the active run handle is installed", async () => {
@@ -321,10 +382,7 @@ describe("runCodexAppServerAttempt", () => {
         }
         if (method === "turn/start") {
           return await new Promise<never>((_, reject) => {
-            setTimeout(
-              () => reject(new Error("turn/start timed out")),
-              Math.max(100, options?.timeoutMs ?? 0),
-            );
+            setTimeout(() => reject(new Error("turn/start timed out")), options?.timeoutMs ?? 0);
           });
         }
         return {};
@@ -464,5 +522,103 @@ describe("runCodexAppServerAttempt", () => {
         serviceTier: "priority",
       }),
     );
+  });
+
+  it("preserves the bound auth profile when resume params omit authProfileId", async () => {
+    const sessionFile = path.join(tempDir, "session.jsonl");
+    const workspaceDir = path.join(tempDir, "workspace");
+    await writeCodexAppServerBinding(sessionFile, {
+      threadId: "thread-existing",
+      cwd: workspaceDir,
+      authProfileId: "openai-codex:bound",
+      model: "gpt-5.4-codex",
+      modelProvider: "openai",
+    });
+    const params = createParams(sessionFile, workspaceDir);
+    delete params.authProfileId;
+
+    const binding = await startOrResumeThread({
+      client: {
+        request: async (method: string) => {
+          if (method === "thread/resume") {
+            return { thread: { id: "thread-existing" }, modelProvider: "openai" };
+          }
+          throw new Error(`unexpected method: ${method}`);
+        },
+      } as never,
+      params,
+      cwd: workspaceDir,
+      dynamicTools: [],
+      appServer: {
+        start: {
+          transport: "stdio",
+          command: "codex",
+          args: ["app-server"],
+          headers: {},
+        },
+        requestTimeoutMs: 60_000,
+        approvalPolicy: "never",
+        approvalsReviewer: "user",
+        sandbox: "workspace-write",
+      },
+    });
+
+    expect(binding.authProfileId).toBe("openai-codex:bound");
+  });
+
+  it("reuses the bound auth profile for app-server startup when params omit it", async () => {
+    const sessionFile = path.join(tempDir, "session.jsonl");
+    const workspaceDir = path.join(tempDir, "workspace");
+    await writeCodexAppServerBinding(sessionFile, {
+      threadId: "thread-existing",
+      cwd: workspaceDir,
+      authProfileId: "openai-codex:bound",
+      model: "gpt-5.4-codex",
+      modelProvider: "openai",
+      dynamicToolsFingerprint: "[]",
+    });
+    const seenAuthProfileIds: Array<string | undefined> = [];
+    const requests: string[] = [];
+    let notify: (notification: CodexServerNotification) => Promise<void> = async () => undefined;
+    __testing.setCodexAppServerClientFactoryForTests(async (_startOptions, authProfileId) => {
+      seenAuthProfileIds.push(authProfileId);
+      return {
+        request: async (method: string) => {
+          requests.push(method);
+          if (method === "thread/resume") {
+            return { thread: { id: "thread-existing" }, modelProvider: "openai" };
+          }
+          if (method === "turn/start") {
+            return { turn: { id: "turn-1", status: "inProgress" } };
+          }
+          throw new Error(`unexpected method: ${method}`);
+        },
+        addNotificationHandler: (handler: typeof notify) => {
+          notify = handler;
+          return () => undefined;
+        },
+        addRequestHandler: () => () => undefined,
+      } as never;
+    });
+    const params = createParams(sessionFile, workspaceDir);
+    delete params.authProfileId;
+
+    const run = runCodexAppServerAttempt(params);
+    await vi.waitFor(() => expect(seenAuthProfileIds).toEqual(["openai-codex:bound"]), {
+      interval: 1,
+    });
+    await vi.waitFor(() => expect(requests).toContain("turn/start"), { interval: 1 });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await notify({
+      method: "turn/completed",
+      params: {
+        threadId: "thread-existing",
+        turnId: "turn-1",
+        turn: { id: "turn-1", status: "completed" },
+      },
+    });
+    await run;
+
+    expect(seenAuthProfileIds).toEqual(["openai-codex:bound"]);
   });
 });

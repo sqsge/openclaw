@@ -30,21 +30,22 @@ import {
   type JsonObject,
   type JsonValue,
 } from "./protocol.js";
-import type { CodexAppServerThreadBinding } from "./session-binding.js";
+import { readCodexAppServerBinding, type CodexAppServerThreadBinding } from "./session-binding.js";
 import { clearSharedCodexAppServerClient, getSharedCodexAppServerClient } from "./shared-client.js";
 import { buildTurnStartParams, startOrResumeThread } from "./thread-lifecycle.js";
 import { mirrorCodexAppServerTranscript } from "./transcript-mirror.js";
 
 type CodexAppServerClientFactory = (
   startOptions?: CodexAppServerStartOptions,
+  authProfileId?: string,
 ) => Promise<CodexAppServerClient>;
 
-let clientFactory: CodexAppServerClientFactory = (startOptions) =>
-  getSharedCodexAppServerClient({ startOptions });
+let clientFactory: CodexAppServerClientFactory = (startOptions, authProfileId) =>
+  getSharedCodexAppServerClient({ startOptions, authProfileId });
 
 export async function runCodexAppServerAttempt(
   params: EmbeddedRunAttemptParams,
-  options: { pluginConfig?: unknown } = {},
+  options: { pluginConfig?: unknown; startupTimeoutFloorMs?: number } = {},
 ): Promise<EmbeddedRunAttemptResult> {
   const appServer = resolveCodexAppServerRuntimeOptions({ pluginConfig: options.pluginConfig });
   const resolvedWorkspace = resolveUserPath(params.workspaceDir);
@@ -78,6 +79,8 @@ export async function runCodexAppServerAttempt(
     agentId: params.agentId,
   });
   let yieldDetected = false;
+  const startupBinding = await readCodexAppServerBinding(params.sessionFile);
+  const startupAuthProfileId = params.authProfileId ?? startupBinding?.authProfileId;
   const tools = await buildDynamicTools({
     params,
     resolvedWorkspace,
@@ -99,9 +102,10 @@ export async function runCodexAppServerAttempt(
   try {
     ({ client, thread } = await withCodexStartupTimeout({
       timeoutMs: params.timeoutMs,
+      timeoutFloorMs: options.startupTimeoutFloorMs,
       signal: runAbortController.signal,
       operation: async () => {
-        const startupClient = await clientFactory(appServer.start);
+        const startupClient = await clientFactory(appServer.start, startupAuthProfileId);
         const startupThread = await startOrResumeThread({
           client: startupClient,
           params,
@@ -371,6 +375,7 @@ async function buildDynamicTools(input: DynamicToolBuildParams) {
 
 async function withCodexStartupTimeout<T>(params: {
   timeoutMs: number;
+  timeoutFloorMs?: number;
   signal: AbortSignal;
   operation: () => Promise<T>;
 }): Promise<T> {
@@ -390,7 +395,7 @@ async function withCodexStartupTimeout<T>(params: {
           }
           reject(error);
         };
-        const timeoutMs = Math.max(100, params.timeoutMs);
+        const timeoutMs = Math.max(params.timeoutFloorMs ?? 100, params.timeoutMs);
         timeout = setTimeout(() => {
           rejectOnce(new Error("codex app-server startup timed out"));
         }, timeoutMs);
@@ -487,6 +492,7 @@ export const __testing = {
     clientFactory = factory;
   },
   resetCodexAppServerClientFactoryForTests(): void {
-    clientFactory = (startOptions) => getSharedCodexAppServerClient({ startOptions });
+    clientFactory = (startOptions, authProfileId) =>
+      getSharedCodexAppServerClient({ startOptions, authProfileId });
   },
 } as const;
