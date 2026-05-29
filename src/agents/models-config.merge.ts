@@ -97,14 +97,17 @@ export function mergeProviderModels(
       implicitValue: implicitModel.maxTokens,
     });
 
-    return {
-      ...explicitModel,
-      input: implicitModel.input,
-      reasoning: "reasoning" in explicitModel ? explicitModel.reasoning : implicitModel.reasoning,
-      ...(contextWindow === undefined ? {} : { contextWindow }),
-      ...(contextTokens === undefined ? {} : { contextTokens }),
-      ...(maxTokens === undefined ? {} : { maxTokens }),
-    };
+    return Object.assign(
+      {},
+      explicitModel,
+      {
+        input: "input" in explicitModel ? explicitModel.input : implicitModel.input,
+        reasoning: `reasoning` in explicitModel ? explicitModel.reasoning : implicitModel.reasoning,
+      },
+      contextWindow === undefined ? {} : { contextWindow },
+      contextTokens === undefined ? {} : { contextTokens },
+      maxTokens === undefined ? {} : { maxTokens },
+    );
   });
 
   for (const implicitModel of implicitModels) {
@@ -209,6 +212,13 @@ function shouldPreserveExistingBaseUrl(params: {
   return !existingApi || !nextApi || existingApi === nextApi;
 }
 
+function isExistingProviderSelfContained(entry: ExistingProviderConfig): boolean {
+  if (!Array.isArray(entry.models) || entry.models.length === 0) {
+    return true;
+  }
+  return Boolean(entry.baseUrl?.trim() && entry.apiKey);
+}
+
 export function mergeWithExistingProviderSecrets(params: {
   nextProviders: Record<string, ProviderConfig>;
   existingProviders: Record<string, ExistingProviderConfig>;
@@ -217,6 +227,9 @@ export function mergeWithExistingProviderSecrets(params: {
   const { nextProviders, existingProviders, secretRefManagedProviders } = params;
   const mergedProviders: Record<string, ProviderConfig> = {};
   for (const [key, entry] of Object.entries(existingProviders)) {
+    if (!isExistingProviderSelfContained(entry)) {
+      continue;
+    }
     mergedProviders[key] = entry;
   }
   for (const [key, newEntry] of Object.entries(nextProviders)) {

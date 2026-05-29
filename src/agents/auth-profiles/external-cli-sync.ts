@@ -1,45 +1,59 @@
 import {
+  readClaudeCliCredentialsCached,
   readCodexCliCredentialsCached,
   readMiniMaxCliCredentialsCached,
 } from "../cli-credentials.js";
+import { normalizeProviderId } from "../provider-id.js";
 import {
+  CLAUDE_CLI_PROFILE_ID,
   EXTERNAL_CLI_SYNC_TTL_MS,
   MINIMAX_CLI_PROFILE_ID,
   OPENAI_CODEX_DEFAULT_PROFILE_ID,
 } from "./constants.js";
 import { log } from "./constants.js";
-import { hasUsableOAuthCredential as hasUsableOAuthCredentialShared } from "./credential-state.js";
+import {
+  areOAuthCredentialsEquivalent,
+  hasUsableOAuthCredential,
+  isSafeToAdoptBootstrapOAuthIdentity,
+  shouldBootstrapFromExternalCliCredential,
+} from "./oauth-shared.js";
 import type { AuthProfileStore, OAuthCredential } from "./types.js";
+
+export {
+  areOAuthCredentialsEquivalent,
+  hasUsableOAuthCredential,
+  isSafeToAdoptBootstrapOAuthIdentity,
+  isSafeToOverwriteStoredOAuthIdentity,
+  shouldBootstrapFromExternalCliCredential,
+  shouldReplaceStoredOAuthCredential,
+} from "./oauth-shared.js";
 
 export type ExternalCliResolvedProfile = {
   profileId: string;
   credential: OAuthCredential;
+  persistence?: "runtime-only" | "persisted";
+};
+
+export type ExternalCliAuthProfileOptions = {
+  allowKeychainPrompt?: boolean;
+  providerIds?: Iterable<string>;
+  profileIds?: Iterable<string>;
 };
 
 type ExternalCliSyncProvider = {
   profileId: string;
   provider: string;
-  readCredentials: () => OAuthCredential | null;
+  aliases?: readonly string[];
+  readCredentials: (
+    options?: Pick<ExternalCliAuthProfileOptions, "allowKeychainPrompt">,
+  ) => OAuthCredential | null;
+  // bootstrapOnly providers adopt the external CLI credential only to
+  // seed an empty slot; once a local OAuth credential exists for the
+  // profile, the local refresh token is treated as canonical and the
+  // CLI state must not replace or shadow it. Codex requires this to
+  // avoid clobbering a locally refreshed token with stale CLI state.
+  bootstrapOnly?: boolean;
 };
-
-export function areOAuthCredentialsEquivalent(
-  a: OAuthCredential | undefined,
-  b: OAuthCredential,
-): boolean {
-  if (!a || a.type !== "oauth") {
-    return false;
-  }
-  return (
-    a.provider === b.provider &&
-    a.access === b.access &&
-    a.refresh === b.refresh &&
-    a.expires === b.expires &&
-    a.email === b.email &&
-    a.enterpriseUrl === b.enterpriseUrl &&
-    a.projectId === b.projectId &&
-    a.accountId === b.accountId
-  );
-}
 
 function normalizeAuthIdentityToken(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
@@ -81,63 +95,37 @@ export function isSafeToUseExternalCliCredential(
   return true;
 }
 
-function hasNewerStoredOAuthCredential(
-  existing: OAuthCredential | undefined,
-  incoming: OAuthCredential,
-): boolean {
-  return Boolean(
-    existing &&
-    existing.provider === incoming.provider &&
-    Number.isFinite(existing.expires) &&
-    (!Number.isFinite(incoming.expires) || existing.expires > incoming.expires),
-  );
-}
-
-export function shouldReplaceStoredOAuthCredential(
-  existing: OAuthCredential | undefined,
-  incoming: OAuthCredential,
-): boolean {
-  if (!existing || existing.type !== "oauth") {
-    return true;
-  }
-  if (areOAuthCredentialsEquivalent(existing, incoming)) {
-    return false;
-  }
-  return !hasNewerStoredOAuthCredential(existing, incoming);
-}
-
-export function hasUsableOAuthCredential(
-  credential: OAuthCredential | undefined,
-  now = Date.now(),
-): boolean {
-  return hasUsableOAuthCredentialShared(credential, { now });
-}
-
-export function shouldBootstrapFromExternalCliCredential(params: {
-  existing: OAuthCredential | undefined;
-  imported: OAuthCredential;
-  now?: number;
-}): boolean {
-  const now = params.now ?? Date.now();
-  if (!isSafeToUseExternalCliCredential(params.existing, params.imported)) {
-    return false;
-  }
-  if (hasUsableOAuthCredential(params.existing, now)) {
-    return false;
-  }
-  return hasUsableOAuthCredential(params.imported, now);
-}
-
 const EXTERNAL_CLI_SYNC_PROVIDERS: ExternalCliSyncProvider[] = [
-  {
-    profileId: MINIMAX_CLI_PROFILE_ID,
-    provider: "minimax-portal",
-    readCredentials: () => readMiniMaxCliCredentialsCached({ ttlMs: EXTERNAL_CLI_SYNC_TTL_MS }),
-  },
   {
     profileId: OPENAI_CODEX_DEFAULT_PROFILE_ID,
     provider: "openai-codex",
-    readCredentials: () => readCodexCliCredentialsCached({ ttlMs: EXTERNAL_CLI_SYNC_TTL_MS }),
+    aliases: ["codex", "codex-cli", "codex-app-server"],
+    readCredentials: (options) =>
+      readCodexCliCredentialsCached({
+        ttlMs: EXTERNAL_CLI_SYNC_TTL_MS,
+        allowKeychainPrompt: options?.allowKeychainPrompt,
+      }),
+    bootstrapOnly: true,
+  },
+  {
+    profileId: CLAUDE_CLI_PROFILE_ID,
+    provider: "claude-cli",
+    readCredentials: (options) => {
+      const credential = readClaudeCliCredentialsCached({
+        ttlMs: EXTERNAL_CLI_SYNC_TTL_MS,
+        allowKeychainPrompt: options?.allowKeychainPrompt,
+      });
+      if (credential?.type !== "oauth") {
+        return null;
+      }
+      return { ...credential, provider: "claude-cli" };
+    },
+  },
+  {
+    profileId: MINIMAX_CLI_PROFILE_ID,
+    provider: "minimax-portal",
+    aliases: ["minimax", "minimax-cli"],
+    readCredentials: () => readMiniMaxCliCredentialsCached({ ttlMs: EXTERNAL_CLI_SYNC_TTL_MS }),
   },
 ];
 
@@ -157,27 +145,115 @@ function resolveExternalCliSyncProvider(params: {
   return provider;
 }
 
+function hasInlineOAuthTokenMaterial(credential: OAuthCredential): boolean {
+  return [credential.access, credential.refresh, credential.idToken].some(
+    (value) => typeof value === "string" && value.trim().length > 0,
+  );
+}
+
 export function readExternalCliBootstrapCredential(params: {
   profileId: string;
   credential: OAuthCredential;
+  allowInlineOAuthTokenMaterial?: boolean;
+  allowKeychainPrompt?: boolean;
 }): OAuthCredential | null {
   const provider = resolveExternalCliSyncProvider(params);
   if (!provider) {
     return null;
   }
-  return provider.readCredentials();
+  if (
+    provider.bootstrapOnly &&
+    !params.allowInlineOAuthTokenMaterial &&
+    hasInlineOAuthTokenMaterial(params.credential)
+  ) {
+    return null;
+  }
+  return provider.readCredentials({ allowKeychainPrompt: params.allowKeychainPrompt });
 }
 
 export const readManagedExternalCliCredential = readExternalCliBootstrapCredential;
 
+export function readExternalCliFallbackCredential(params: {
+  profileId: string;
+  credential: OAuthCredential;
+  allowKeychainPrompt?: boolean;
+}): OAuthCredential | null {
+  const provider =
+    resolveExternalCliSyncProvider(params) ??
+    EXTERNAL_CLI_SYNC_PROVIDERS.find((entry) => entry.provider === params.credential.provider);
+  if (!provider) {
+    return null;
+  }
+  return provider.readCredentials({ allowKeychainPrompt: params.allowKeychainPrompt });
+}
+
+function normalizeProviderScope(values: Iterable<string> | undefined): Set<string> | undefined {
+  if (values === undefined) {
+    return undefined;
+  }
+  const out = new Set<string>();
+  for (const value of values) {
+    const raw = value.trim();
+    if (!raw) {
+      continue;
+    }
+    out.add(raw.toLowerCase());
+    const normalized = normalizeProviderId(raw);
+    if (normalized) {
+      out.add(normalized);
+    }
+  }
+  return out;
+}
+
+function normalizeProfileScope(values: Iterable<string> | undefined): Set<string> | undefined {
+  if (values === undefined) {
+    return undefined;
+  }
+  const out = new Set<string>();
+  for (const value of values) {
+    const raw = value.trim().toLowerCase();
+    if (raw) {
+      out.add(raw);
+    }
+  }
+  return out;
+}
+
+function isExternalCliProviderInScope(params: {
+  providerConfig: ExternalCliSyncProvider;
+  store: AuthProfileStore;
+  options?: ExternalCliAuthProfileOptions;
+}): boolean {
+  const { providerConfig, options, store } = params;
+  const providerScope = normalizeProviderScope(options?.providerIds);
+  const profileScope = normalizeProfileScope(options?.profileIds);
+  if (providerScope === undefined && profileScope === undefined) {
+    const existing = store.profiles[providerConfig.profileId];
+    return existing?.type === "oauth" && existing.provider === providerConfig.provider;
+  }
+  if (profileScope?.has(providerConfig.profileId.toLowerCase())) {
+    return true;
+  }
+  if (!providerScope || providerScope.size === 0) {
+    return false;
+  }
+  const aliases = [providerConfig.provider, ...(providerConfig.aliases ?? [])];
+  return aliases.some((alias) => {
+    const raw = alias.trim().toLowerCase();
+    const normalized = normalizeProviderId(alias);
+    return providerScope.has(raw) || (normalized ? providerScope.has(normalized) : false);
+  });
+}
+
 export function resolveExternalCliAuthProfiles(
   store: AuthProfileStore,
+  options?: ExternalCliAuthProfileOptions,
 ): ExternalCliResolvedProfile[] {
   const profiles: ExternalCliResolvedProfile[] = [];
   const now = Date.now();
   for (const providerConfig of EXTERNAL_CLI_SYNC_PROVIDERS) {
-    const creds = providerConfig.readCredentials();
-    if (!creds) {
+    if (!isExternalCliProviderInScope({ providerConfig, store, options })) {
       continue;
     }
     const existing = store.profiles[providerConfig.profileId];
@@ -194,8 +270,43 @@ export function resolveExternalCliAuthProfiles(
       });
       continue;
     }
+    if (
+      providerConfig.bootstrapOnly &&
+      existingOAuth &&
+      hasInlineOAuthTokenMaterial(existingOAuth)
+    ) {
+      log.debug("kept local oauth over external cli bootstrap-only provider", {
+        profileId: providerConfig.profileId,
+        provider: providerConfig.provider,
+      });
+      continue;
+    }
+    if (
+      existingOAuth &&
+      !providerConfig.bootstrapOnly &&
+      hasUsableOAuthCredential(existingOAuth, now)
+    ) {
+      continue;
+    }
+    const creds = providerConfig.readCredentials({
+      allowKeychainPrompt: options?.allowKeychainPrompt,
+    });
+    if (!creds) {
+      continue;
+    }
     if (existingOAuth && !isSafeToUseExternalCliCredential(existingOAuth, creds)) {
       log.warn("refused external cli oauth bootstrap: identity mismatch", {
+        profileId: providerConfig.profileId,
+        provider: providerConfig.provider,
+      });
+      continue;
+    }
+    if (
+      existingOAuth &&
+      !isSafeToAdoptBootstrapOAuthIdentity(existingOAuth, creds) &&
+      !areOAuthCredentialsEquivalent(existingOAuth, creds)
+    ) {
+      log.warn("refused external cli oauth bootstrap: identity mismatch or missing binding", {
         profileId: providerConfig.profileId,
         provider: providerConfig.provider,
       });
@@ -227,6 +338,7 @@ export function resolveExternalCliAuthProfiles(
     profiles.push({
       profileId: providerConfig.profileId,
       credential: creds,
+      persistence: providerConfig.bootstrapOnly ? "runtime-only" : "persisted",
     });
   }
   return profiles;
